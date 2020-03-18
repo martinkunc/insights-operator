@@ -206,6 +206,7 @@ func addMeta(r *certificatesv1b1api.CertificateSigningRequest, c *CSRAnonymizedF
 	if r == nil || c == nil {
 		return
 	}
+	c.CreationTime = r.CreationTimestamp.Time.Format(time.RFC3339)
 	c.TypeMeta = r.TypeMeta
 	c.ObjectMeta = r.ObjectMeta
 }
@@ -224,10 +225,11 @@ func anonymizeCSR(r *certificatesv1b1api.CertificateSigningRequest) *CSRAnonymiz
 }
 
 type CSRAnonymizedFeatures struct {
-	TypeMeta   metav1.TypeMeta
-	ObjectMeta metav1.ObjectMeta
-	Spec       *StateFeatures
-	Status     *StatusFeatures
+	CreationTime string
+	TypeMeta     metav1.TypeMeta
+	ObjectMeta   metav1.ObjectMeta
+	Spec         *StateFeatures
+	Status       *StatusFeatures
 }
 
 type StateFeatures struct {
