@@ -106,10 +106,13 @@ github.com/munnerz/goautoneg
 # github.com/openshift/api v3.9.1-0.20190718162300-9525304a0adb+incompatible => github.com/openshift/api v0.0.0-20191031084152-11eee842dafd
 github.com/openshift/api/config/v1
 github.com/openshift/api/operator/v1alpha1
-# github.com/openshift/client-go v0.0.0-20190627172412-c44a8b61b9f4 => github.com/openshift/client-go v0.0.0-20191022152013-2823239d2298
+# github.com/openshift/client-go v0.0.0-20200116152001-92a2713fa240 => github.com/openshift/client-go v0.0.0-20200116152001-92a2713fa240
+github.com/openshift/client-go/config/clientset/versioned
+github.com/openshift/client-go/config/clientset/versioned/fake
 github.com/openshift/client-go/config/clientset/versioned/scheme
 github.com/openshift/client-go/config/clientset/versioned/typed/config/v1
-# github.com/openshift/library-go v0.0.0-20190717192022-0597a29991ca50513df1fdb76e7e2a267e3a3e3f => github.com/openshift/library-go v0.0.0-20191118102510-4e2c7112d252
+github.com/openshift/client-go/config/clientset/versioned/typed/config/v1/fake
+# github.com/openshift/library-go v0.0.0-20200120153246-906409ae5e38 => github.com/openshift/library-go v0.0.0-20200120153246-906409ae5e38
 github.com/openshift/library-go/pkg/config/client
 github.com/openshift/library-go/pkg/config/configdefaults
 github.com/openshift/library-go/pkg/config/leaderelection
