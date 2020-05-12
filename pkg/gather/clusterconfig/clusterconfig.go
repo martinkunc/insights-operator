@@ -11,10 +11,7 @@ import (
 	"sync"
 	"time"
 
-	configv1 "github.com/openshift/api/config/v1"
-	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
 	_ "k8s.io/client-go/kubernetes"
-	certificatesv1beta1 "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
