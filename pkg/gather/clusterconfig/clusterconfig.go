@@ -2,6 +2,8 @@ package clusterconfig
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"regexp"
 	"sort"
@@ -10,7 +12,6 @@ import (
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
-	"github.com/openshift/client-go/config/clientset/versioned/scheme"
 	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
 	_ "k8s.io/client-go/kubernetes"
 	certificatesv1beta1 "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
@@ -19,45 +20,68 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/json"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
+	certificatesv1beta1 "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog"
+
+	configv1 "github.com/openshift/api/config/v1"
+	registryv1 "github.com/openshift/api/imageregistry/v1"
+	openshiftscheme "github.com/openshift/client-go/config/clientset/versioned/scheme"
+	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
+	imageregistryv1 "github.com/openshift/client-go/imageregistry/clientset/versioned/typed/imageregistry/v1"
 
 	"github.com/openshift/insights-operator/pkg/record"
 )
 
 var (
-	serializer     = scheme.Codecs.LegacyCodec(configv1.SchemeGroupVersion)
-	kubeSerializer = kubescheme.Codecs.LegacyCodec(corev1.SchemeGroupVersion)
+	openshiftSerializer = openshiftscheme.Codecs.LegacyCodec(configv1.SchemeGroupVersion)
+	kubeSerializer      = kubescheme.Codecs.LegacyCodec(corev1.SchemeGroupVersion)
 
 	// maxEventTimeInterval represents the "only keep events that are maximum 1h old"
 	// TODO: make this dynamic like the reporting window based on configured interval
 	maxEventTimeInterval = 1 * time.Hour
+
+	registrySerializer serializer.CodecFactory
+	registryScheme     = runtime.NewScheme()
 )
 
-type Gatherer struct {
-	client        configv1client.ConfigV1Interface
-	coreClient    corev1client.CoreV1Interface
-	metricsClient rest.Interface
-	certClient    certificatesv1beta1.CertificatesV1beta1Interface
-	lock          sync.Mutex
-	lastVersion   *configv1.ClusterVersion
+func init() {
+	utilruntime.Must(registryv1.AddToScheme(registryScheme))
+	registrySerializer = serializer.NewCodecFactory(registryScheme)
 }
 
-func New(client configv1client.ConfigV1Interface, coreClient corev1client.CoreV1Interface, certClient certificatesv1beta1.CertificatesV1beta1Interface, metricsClient rest.Interface) *Gatherer {
+// Gatherer is a driving instance invoking collection of data
+type Gatherer struct {
+	client         configv1client.ConfigV1Interface
+	coreClient     corev1client.CoreV1Interface
+	metricsClient  rest.Interface
+	certClient     certificatesv1beta1.CertificatesV1beta1Interface
+	registryClient imageregistryv1.ImageregistryV1Interface
+	lock           sync.Mutex
+	lastVersion    *configv1.ClusterVersion
+}
+
+// New creates new Gatherer
+func New(client configv1client.ConfigV1Interface, coreClient corev1client.CoreV1Interface, certClient certificatesv1beta1.CertificatesV1beta1Interface, metricsClient rest.Interface,
+	registryClient imageregistryv1.ImageregistryV1Interface) *Gatherer {
 	return &Gatherer{
-		client:        client,
-		coreClient:    coreClient,
-		certClient:    certClient,
-		metricsClient: metricsClient,
+		client:         client,
+		coreClient:     coreClient,
+		certClient:     certClient,
+		metricsClient:  metricsClient,
+		registryClient: registryClient,
 	}
 }
 
 var reInvalidUIDCharacter = regexp.MustCompile(`[^a-z0-9\-]`)
 
+// Gather is hosting and calling all the recording functions
 func (i *Gatherer) Gather(ctx context.Context, recorder record.Interface) error {
 	return record.Collect(ctx, recorder,
 		GatherMostRecentMetrics(i),
@@ -69,6 +93,7 @@ func (i *Gatherer) Gather(ctx context.Context, recorder record.Interface) error 
 		GatherClusterInfrastructure(i),
 		GatherClusterNetwork(i),
 		GatherClusterAuthentication(i),
+		GatherClusterImageRegistry(i),
 		GatherClusterFeatureGates(i),
 		GatherClusterOAuth(i),
 		GatherClusterIngress(i),
@@ -324,6 +349,22 @@ func GatherClusterAuthentication(i *Gatherer) func() ([]record.Record, []error) 
 	}
 }
 
+// GatherClusterImageRegistry fetches the cluster Image Registry configuration
+//
+// Location in archive: config/imageregistry/
+func GatherClusterImageRegistry(i *Gatherer) func() ([]record.Record, []error) {
+	return func() ([]record.Record, []error) {
+		config, err := i.registryClient.Configs().Get("cluster", metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, []error{err}
+		}
+		return []record.Record{{Name: "config/imageregistry", Item: ImageRegistryAnonymizer{config}}}, nil
+	}
+}
+
 // GatherClusterFeatureGates fetches the cluster FeatureGate - the FeatureGate with name cluster.
 //
 // The Kubernetes api https://github.com/openshift/client-go/blob/master/config/clientset/versioned/typed/config/v1/featuregate.go#L50
@@ -469,6 +510,7 @@ func (i *Gatherer) gatherNamespaceEvents(namespace string) ([]record.Record, []e
 // RawByte is skipping Marshalling from byte slice
 type RawByte []byte
 
+// Marshal just returns bytes
 func (r RawByte) Marshal(_ context.Context) ([]byte, error) {
 	return r, nil
 }
@@ -476,6 +518,7 @@ func (r RawByte) Marshal(_ context.Context) ([]byte, error) {
 // Raw is another simplification of marshalling from string
 type Raw struct{ string }
 
+// Marshal returns raw bytes
 func (r Raw) Marshal(_ context.Context) ([]byte, error) {
 	return []byte(r.string), nil
 }
@@ -483,14 +526,17 @@ func (r Raw) Marshal(_ context.Context) ([]byte, error) {
 // Anonymizer returns serialized runtime.Object without change
 type Anonymizer struct{ runtime.Object }
 
+// Marshal serializes with OpenShift client-go openshiftSerializer
 func (a Anonymizer) Marshal(_ context.Context) ([]byte, error) {
-	return runtime.Encode(serializer, a.Object)
+	return runtime.Encode(openshiftSerializer, a.Object)
 }
 
+// InfrastructureAnonymizer anonymizes infrastructure
 type InfrastructureAnonymizer struct{ *configv1.Infrastructure }
 
+// Marshal serializes Infrastructure with anonymization
 func (a InfrastructureAnonymizer) Marshal(_ context.Context) ([]byte, error) {
-	return runtime.Encode(serializer, anonymizeInfrastructure(a.Infrastructure))
+	return runtime.Encode(openshiftSerializer, anonymizeInfrastructure(a.Infrastructure))
 }
 
 func anonymizeInfrastructure(config *configv1.Infrastructure) *configv1.Infrastructure {
@@ -501,26 +547,68 @@ func anonymizeInfrastructure(config *configv1.Infrastructure) *configv1.Infrastr
 	return config
 }
 
+// ClusterVersionAnonymizer is serializing ClusterVersion with anonymization
 type ClusterVersionAnonymizer struct{ *configv1.ClusterVersion }
 
+// Marshal serializes ClusterVersion with anonymization
 func (a ClusterVersionAnonymizer) Marshal(_ context.Context) ([]byte, error) {
 	a.ClusterVersion.Spec.Upstream = configv1.URL(anonymizeURL(string(a.ClusterVersion.Spec.Upstream)))
-	return runtime.Encode(serializer, a.ClusterVersion)
+	return runtime.Encode(openshiftSerializer, a.ClusterVersion)
 }
 
+// FeatureGateAnonymizer implements serializaton of FeatureGate with anonymization
 type FeatureGateAnonymizer struct{ *configv1.FeatureGate }
 
+// Marshal serializes FeatureGate with anonymization
 func (a FeatureGateAnonymizer) Marshal(_ context.Context) ([]byte, error) {
-	return runtime.Encode(serializer, a.FeatureGate)
+	return runtime.Encode(openshiftSerializer, a.FeatureGate)
 }
 
+// IngressAnonymizer implements serialization with marshalling
+type ImageRegistryAnonymizer struct {
+	*registryv1.Config
+}
+
+// Marshal implements serialization of Ingres.Spec.Domain with anonymization
+func (a ImageRegistryAnonymizer) Marshal(_ context.Context) ([]byte, error) {
+	a.Spec.HTTPSecret = anonymizeString(a.Spec.HTTPSecret)
+	if a.Spec.Storage.S3 != nil {
+		a.Spec.Storage.S3.Bucket = anonymizeString(a.Spec.Storage.S3.Bucket)
+		a.Spec.Storage.S3.KeyID = anonymizeString(a.Spec.Storage.S3.KeyID)
+		a.Spec.Storage.S3.RegionEndpoint = anonymizeString(a.Spec.Storage.S3.RegionEndpoint)
+		a.Spec.Storage.S3.Region = anonymizeString(a.Spec.Storage.S3.Region)
+	}
+	if a.Spec.Storage.Azure != nil {
+		a.Spec.Storage.Azure.AccountName = anonymizeString(a.Spec.Storage.Azure.AccountName)
+		a.Spec.Storage.Azure.Container = anonymizeString(a.Spec.Storage.Azure.Container)
+	}
+	if a.Spec.Storage.GCS != nil {
+		a.Spec.Storage.GCS.Bucket = anonymizeString(a.Spec.Storage.GCS.Bucket)
+		a.Spec.Storage.GCS.ProjectID = anonymizeString(a.Spec.Storage.GCS.ProjectID)
+		a.Spec.Storage.GCS.KeyID = anonymizeString(a.Spec.Storage.GCS.KeyID)
+	}
+	if a.Spec.Storage.Swift != nil {
+		a.Spec.Storage.Swift.AuthURL = anonymizeString(a.Spec.Storage.Swift.AuthURL)
+		a.Spec.Storage.Swift.Container = anonymizeString(a.Spec.Storage.Swift.Container)
+		a.Spec.Storage.Swift.Domain = anonymizeString(a.Spec.Storage.Swift.Domain)
+		a.Spec.Storage.Swift.DomainID = anonymizeString(a.Spec.Storage.Swift.DomainID)
+		a.Spec.Storage.Swift.Tenant = anonymizeString(a.Spec.Storage.Swift.Tenant)
+		a.Spec.Storage.Swift.TenantID = anonymizeString(a.Spec.Storage.Swift.TenantID)
+		a.Spec.Storage.Swift.RegionName = anonymizeString(a.Spec.Storage.Swift.RegionName)
+	}
+	return runtime.Encode(registrySerializer.LegacyCodec(registryv1.SchemeGroupVersion), a.Config)
+}
+
+// IngressAnonymizer implements serialization with marshalling
 type IngressAnonymizer struct{ *configv1.Ingress }
 
+// Marshal implements serialization of Ingres.Spec.Domain with anonymization
 func (a IngressAnonymizer) Marshal(_ context.Context) ([]byte, error) {
 	a.Ingress.Spec.Domain = anonymizeURL(a.Ingress.Spec.Domain)
-	return runtime.Encode(serializer, a.Ingress)
+	return runtime.Encode(openshiftSerializer, a.Ingress)
 }
 
+// CompactedEvent holds one Namespace Event
 type CompactedEvent struct {
 	Namespace     string    `json:"namespace"`
 	LastTimestamp time.Time `json:"lastTimestamp"`
@@ -528,17 +616,23 @@ type CompactedEvent struct {
 	Message       string    `json:"message"`
 }
 
+// CompactedEventList is collection of events
 type CompactedEventList struct {
 	Items []CompactedEvent `json:"items"`
 }
+
+// EventAnonymizer implements serializaion of Events with anonymization
 type EventAnonymizer struct{ *CompactedEventList }
 
+// Marshal serializes Events with anonymization
 func (a EventAnonymizer) Marshal(_ context.Context) ([]byte, error) {
 	return json.Marshal(a.CompactedEventList)
 }
 
+// ProxyAnonymizer implements serialization of HttpProxy/NoProxy with anonymization
 type ProxyAnonymizer struct{ *configv1.Proxy }
 
+// Marshal implements Proxy serialization with anonymization
 func (a ProxyAnonymizer) Marshal(_ context.Context) ([]byte, error) {
 	a.Proxy.Spec.HTTPProxy = anonymizeURLCSV(a.Proxy.Spec.HTTPProxy)
 	a.Proxy.Spec.HTTPSProxy = anonymizeURLCSV(a.Proxy.Spec.HTTPSProxy)
@@ -547,7 +641,7 @@ func (a ProxyAnonymizer) Marshal(_ context.Context) ([]byte, error) {
 	a.Proxy.Status.HTTPProxy = anonymizeURLCSV(a.Proxy.Status.HTTPProxy)
 	a.Proxy.Status.HTTPSProxy = anonymizeURLCSV(a.Proxy.Status.HTTPSProxy)
 	a.Proxy.Status.NoProxy = anonymizeURLCSV(a.Proxy.Status.NoProxy)
-	return runtime.Encode(serializer, a.Proxy)
+	return runtime.Encode(openshiftSerializer, a.Proxy)
 }
 
 func anonymizeURLCSV(s string) string {
@@ -568,10 +662,12 @@ var reURL = regexp.MustCompile(`[^\.\-/\:]`)
 
 func anonymizeURL(s string) string { return reURL.ReplaceAllString(s, "x") }
 
+// ClusterOperatorAnonymizer implements serialization of ClusterOperator without change
 type ClusterOperatorAnonymizer struct{ *configv1.ClusterOperator }
 
+// Marshal serializes ClusterOperator
 func (a ClusterOperatorAnonymizer) Marshal(_ context.Context) ([]byte, error) {
-	return runtime.Encode(serializer, a.ClusterOperator)
+	return runtime.Encode(openshiftSerializer, a.ClusterOperator)
 }
 
 func isHealthyOperator(operator *configv1.ClusterOperator) bool {
@@ -595,8 +691,10 @@ func namespacesForOperator(operator *configv1.ClusterOperator) []string {
 	return ns
 }
 
+// NodeAnonymizer implements serialization of Node with anonymization
 type NodeAnonymizer struct{ *corev1.Node }
 
+// Marshal implements serialization of Node with anonymization
 func (a NodeAnonymizer) Marshal(_ context.Context) ([]byte, error) {
 	return runtime.Encode(kubeSerializer, anonymizeNode(a.Node))
 }
@@ -641,8 +739,10 @@ func isHealthyNode(node *corev1.Node) bool {
 	return true
 }
 
+// PodAnonymizer implements serialization with anonymization for a Pod
 type PodAnonymizer struct{ *corev1.Pod }
 
+// Marshal implements serialization of a Pod with anonymization
 func (a PodAnonymizer) Marshal(_ context.Context) ([]byte, error) {
 	return runtime.Encode(kubeSerializer, anonymizePod(a.Pod))
 }
@@ -696,8 +796,49 @@ func (i *Gatherer) setClusterVersion(version *configv1.ClusterVersion) {
 	i.lastVersion = version.DeepCopy()
 }
 
+// ClusterVersion returns Version for this cluster, which is set by running version during Gathering
 func (i *Gatherer) ClusterVersion() *configv1.ClusterVersion {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 	return i.lastVersion
+}
+
+// ConfigMapAnonymizer implements serialization of configmap
+// and potentially anonymizes if it is a certificate
+type ConfigMapAnonymizer struct {
+	v            []byte
+	encodeBase64 bool
+}
+
+// Marshal implements serialization of Node with anonymization
+func (a ConfigMapAnonymizer) Marshal(_ context.Context) ([]byte, error) {
+	c := []byte(anonymizeConfigMap(a.v))
+	if a.encodeBase64 {
+		buff := make([]byte, base64.StdEncoding.EncodedLen(len(c)))
+		base64.StdEncoding.Encode(buff, []byte(c))
+		c = buff
+	}
+	return c, nil
+}
+
+func anonymizeConfigMap(dv []byte) string {
+	anonymizedPemBlock := `-----BEGIN CERTIFICATE-----
+ANONYMIZED
+-----END CERTIFICATE-----
+`
+	var sb strings.Builder
+	r := dv
+	for {
+		var block *pem.Block
+		block, r = pem.Decode(r)
+		if block == nil {
+			// cannot be extracted
+			return string(dv)
+		}
+		sb.WriteString(anonymizedPemBlock)
+		if len(r) == 0 {
+			break
+		}
+	}
+	return sb.String()
 }

@@ -18,6 +18,8 @@ import (
 	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
 	"github.com/openshift/library-go/pkg/controller/controllercmd"
 
+	imageregistryv1client "github.com/openshift/client-go/imageregistry/clientset/versioned"
+
 	"github.com/openshift/insights-operator/pkg/authorizer/clusterauthorizer"
 	"github.com/openshift/insights-operator/pkg/config"
 	"github.com/openshift/insights-operator/pkg/config/configobserver"
@@ -51,14 +53,12 @@ func (s *Support) LoadConfig(obj map[string]interface{}) error {
 	return nil
 }
 
-func (s *Support) Run(controller *controllercmd.ControllerContext) error {
+func (s *Support) Run(ctx context.Context, controller *controllercmd.ControllerContext) error {
 	klog.Infof("Starting insights-operator %s", version.Get().String())
 
 	if err := s.LoadConfig(controller.ComponentConfig.Object); err != nil {
 		return err
 	}
-
-	ctx := context.Background()
 
 	// these are operator clients
 	kubeClient, err := kubernetes.NewForConfig(controller.ProtoKubeConfig)
@@ -109,6 +109,11 @@ func (s *Support) Run(controller *controllercmd.ControllerContext) error {
 		return err
 	}
 
+	registryClient, err := imageregistryv1client.NewForConfig(gatherKubeConfig)
+	if err != nil {
+		return err
+	}
+
 	// ensure the insight snapshot directory exists
 	if _, err := os.Stat(s.StoragePath); err != nil && os.IsNotExist(err) {
 		if err := os.MkdirAll(s.StoragePath, 0777); err != nil {
@@ -131,7 +136,7 @@ func (s *Support) Run(controller *controllercmd.ControllerContext) error {
 
 	// the gatherers periodically check the state of the cluster and report any
 	// config to the recorder
-	configPeriodic := clusterconfig.New(gatherConfigClient, gatherKubeClient.CoreV1(), gatherKubeClient.CertificatesV1beta1(), metricsClient)
+	configPeriodic := clusterconfig.New(gatherConfigClient, gatherKubeClient.CoreV1(), gatherKubeClient.CertificatesV1beta1(), metricsClient, registryClient.ImageregistryV1())
 	periodic := periodic.New(configObserver, recorder, map[string]gather.Interface{
 		"config": configPeriodic,
 	})
